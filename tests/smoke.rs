@@ -1,23 +1,20 @@
 extern crate mio;
-extern crate mio_named_pipes;
+extern crate mio_uds_windows;
 extern crate env_logger;
-extern crate rand;
+extern crate tempdir;
 extern crate winapi;
 
 #[macro_use]
 extern crate log;
 
-use std::fs::OpenOptions;
-use std::io::prelude::*;
-use std::io;
-use std::os::windows::fs::*;
-use std::os::windows::io::*;
+use std::io::{self, Read, Write};
+use std::net::Shutdown;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use mio::{Poll, Ready, Token, PollOpt, Events};
-use mio_named_pipes::NamedPipe;
-use rand::Rng;
-use winapi::um::winbase::*;
+use mio_uds_windows::{UnixListener, UnixStream};
+use tempdir::TempDir;
 
 macro_rules! t {
     ($e:expr) => (match $e {
@@ -26,34 +23,39 @@ macro_rules! t {
     })
 }
 
-fn server() -> (NamedPipe, String) {
-    let num: u64 = rand::thread_rng().gen();
-    let name = format!(r"\\.\pipe\my-pipe-{}", num);
-    let pipe = t!(NamedPipe::new(&name));
-    (pipe, name)
-}
+struct TempPath(TempDir);
 
-fn client(name: &str) -> NamedPipe {
-    let mut opts = OpenOptions::new();
-    opts.read(true)
-        .write(true)
-        .custom_flags(FILE_FLAG_OVERLAPPED);
-    let file = t!(opts.open(name));
-    unsafe {
-        NamedPipe::from_raw_handle(file.into_raw_handle())
+impl TempPath {
+    fn new() -> Result<TempPath, io::Error> {
+        let dir = TempDir::new("mio-uds-windows")?;
+        Ok(TempPath(dir))
+    }
+
+    fn name(&self) -> PathBuf {
+        self.0.path().join("sock")
     }
 }
 
-fn pipe() -> (NamedPipe, NamedPipe) {
-    let (pipe, name) = server();
-    (pipe, client(&name))
+fn server() -> (UnixListener, TempPath) {
+    let path = t!(TempPath::new());
+    let stream = t!(UnixListener::bind(path.name()));
+    (stream, path)
+}
+
+fn client(path: &Path) -> UnixStream {
+    t!(UnixStream::connect(path))
+}
+
+fn session() -> (UnixListener, UnixStream) {
+    let (server, path) = server();
+    (server, client(&path.name()))
 }
 
 #[test]
 fn writable_after_register() {
     drop(env_logger::init());
 
-    let (server, client) = pipe();
+    let (server, client) = session();
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -81,7 +83,7 @@ fn writable_after_register() {
 fn write_then_read() {
     drop(env_logger::init());
 
-    let (mut server, mut client) = pipe();
+    let (server, mut client) = session();
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -93,7 +95,19 @@ fn write_then_read() {
                      PollOpt::edge()));
 
     let mut events = Events::with_capacity(128);
-    t!(poll.poll(&mut events, None));
+
+    loop {
+        t!(poll.poll(&mut events, None));
+        let events = events.iter().collect::<Vec<_>>();
+        debug!("events {:?}", events);
+        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
+            if event.readiness().is_readable() {
+                break
+            }
+        }
+    }
+
+    let (mut conn, _) = server.accept().unwrap();
 
     assert_eq!(t!(client.write(b"1234")), 4);
 
@@ -109,15 +123,15 @@ fn write_then_read() {
     }
 
     let mut buf = [0; 10];
-    assert_eq!(t!(server.read(&mut buf)), 4);
+    assert_eq!(t!(conn.read(&mut buf)), 4);
     assert_eq!(&buf[..4], b"1234");
 }
 
 #[test]
-fn connect_before_client() {
+fn accept_before_client() {
     drop(env_logger::init());
 
-    let (server, name) = server();
+    let (server, path) = server();
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -129,10 +143,10 @@ fn connect_before_client() {
     let e = events.iter().collect::<Vec<_>>();
     debug!("events {:?}", e);
     assert_eq!(e.len(), 0);
-    assert_eq!(server.connect().err().unwrap().kind(),
+    assert_eq!(server.accept().err().unwrap().kind(),
                io::ErrorKind::WouldBlock);
 
-    let client = client(&name);
+    let client = client(&path.name());
     t!(poll.register(&client,
                      Token(1),
                      Ready::readable() | Ready::writable(),
@@ -150,10 +164,10 @@ fn connect_before_client() {
 }
 
 #[test]
-fn connect_after_client() {
+fn accept_after_client() {
     drop(env_logger::init());
 
-    let (server, name) = server();
+    let (server, path) = server();
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -166,12 +180,12 @@ fn connect_after_client() {
     debug!("events {:?}", e);
     assert_eq!(e.len(), 0);
 
-    let client = client(&name);
+    let client = client(&path.name());
     t!(poll.register(&client,
                      Token(1),
                      Ready::readable() | Ready::writable(),
                      PollOpt::edge()));
-    t!(server.connect());
+    t!(server.accept());
     loop {
         t!(poll.poll(&mut events, None));
         let e = events.iter().collect::<Vec<_>>();
@@ -188,7 +202,8 @@ fn connect_after_client() {
 fn write_then_drop() {
     drop(env_logger::init());
 
-    let (mut server, mut client) = pipe();
+    let (server, mut client) = session();
+    let (mut conn, _) = server.accept().unwrap();
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -215,7 +230,7 @@ fn write_then_drop() {
     }
 
     let mut buf = [0; 10];
-    assert_eq!(t!(server.read(&mut buf)), 4);
+    assert_eq!(t!(conn.read(&mut buf)), 4);
     assert_eq!(&buf[..4], b"1234");
 }
 
@@ -223,8 +238,9 @@ fn write_then_drop() {
 fn connect_twice() {
     drop(env_logger::init());
 
-    let (mut server, name) = server();
-    let c1 = client(&name);
+    let (server, path) = server();
+    let (mut conn1, _) = server.accept().unwrap();
+    let c1 = client(&path.name());
     let poll = t!(Poll::new());
     t!(poll.register(&server,
                      Token(0),
@@ -250,12 +266,13 @@ fn connect_twice() {
     }
 
     let mut buf = [0; 10];
-    assert_eq!(t!(server.read(&mut buf)), 0);
-    t!(server.disconnect());
-    assert_eq!(server.connect().err().unwrap().kind(),
+    assert_eq!(t!(conn1.read(&mut buf)), 0);
+    t!(conn1.shutdown(Shutdown::Both));
+    assert_eq!(server.accept().err().unwrap().kind(),
                io::ErrorKind::WouldBlock);
 
-    let c2 = client(&name);
+    let c2 = client(&path.name());
+    let _conn2 = server.accept().unwrap();
     t!(poll.register(&c2,
                      Token(2),
                      Ready::readable() | Ready::writable(),
