@@ -16,7 +16,7 @@ use std::net::Shutdown;
 use std::os::raw::{c_int, c_ulong};
 use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket, RawSocket};
 use std::ptr;
-// use std::sync::Once;
+use std::sync::Once;
 
 use inner::{cvt, last_error};
 
@@ -28,28 +28,30 @@ use winapi::{
     um::winbase::HANDLE_FLAG_INHERIT,
     um::winsock2::{
         accept, closesocket, getsockopt as c_getsockopt, ioctlsocket, shutdown as c_shutdown,
-        WSADuplicateSocketW, WSASocketW,
+        WSAStartup, WSADuplicateSocketW, WSASocketW,
         FIONBIO, SD_BOTH, SD_RECEIVE, SD_SEND,
-        INVALID_SOCKET, SOCKET, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
+        INVALID_SOCKET, SOCKET, WSADATA, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
     },
     um::ws2tcpip::socklen_t
 };
+
+// use winapi::um::winsock2::WSACleanup;
 
 pub struct Socket(SOCKET);
 
 /// Checks whether the Windows socket interface has been started already, and
 /// if not, starts it.
 pub fn init() {
-    // static START: Once = Once::new();
+    static START: Once = Once::new();
 
-    // START.call_once(|| unsafe {
-    //     let mut data: WSADATA = mem::zeroed();
-    //     let ret = WSAStartup(0x202, // version 2.2
-    //                             &mut data);
-    //     assert_eq!(ret, 0);
+    START.call_once(|| unsafe {
+        let mut data: WSADATA = mem::zeroed();
+        let ret = WSAStartup(0x202, // version 2.2
+                                &mut data);
+        assert_eq!(ret, 0);
 
-    //     let _ = std::rt::at_exit(|| { WSACleanup(); });
-    // });
+        // let _ = std::rt::at_exit(|| { WSACleanup(); });
+    });
 }
 
 #[doc(hidden)]

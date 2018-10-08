@@ -546,7 +546,7 @@ mod test {
 
     #[test]
     fn basic() {
-        let (_, socket_path) = or_panic!(tmpdir());
+        let (_dir, socket_path) = or_panic!(tmpdir());
         // let msg1 = b"hello";
         // let msg2 = b"world!";
 
@@ -596,7 +596,7 @@ mod test {
 
     #[test]
     fn try_clone() {
-        let (_, socket_path) = or_panic!(tmpdir());
+        let (_dir, socket_path) = or_panic!(tmpdir());
         // let msg1 = b"hello";
         // let msg2 = b"world";
 
@@ -624,7 +624,7 @@ mod test {
 
     #[test]
     fn iter() {
-        let (_, socket_path) = or_panic!(tmpdir());
+        let (_dir, socket_path) = or_panic!(tmpdir());
 
         let listener = or_panic!(UnixListener::bind(&socket_path));
         let thread = thread::spawn(move || {
@@ -664,7 +664,7 @@ mod test {
 
     // #[test]
     // fn timeouts() {
-    //     let (_, socket_path) = or_panic!(tmpdir());
+    //     let (_dir, socket_path) = or_panic!(tmpdir());
 
     //     let _listener = or_panic!(UnixListener::bind(&socket_path));
 
@@ -690,7 +690,7 @@ mod test {
 
     // #[test]
     // fn test_read_timeout() {
-    //     let (_, socket_path) = or_panic!(tmpdir());
+    //     let (_dir, socket_path) = or_panic!(tmpdir());
 
     //     let _listener = or_panic!(UnixListener::bind(&socket_path));
 
@@ -704,7 +704,7 @@ mod test {
 
     // #[test]
     // fn test_read_with_timeout() {
-    //     let (_, socket_path) = or_panic!(tmpdir());
+    //     let (_dir, socket_path) = or_panic!(tmpdir());
 
     //     let listener = or_panic!(UnixListener::bind(&socket_path));
 
@@ -727,7 +727,7 @@ mod test {
     // // when passed zero Durations
     // #[test]
     // fn test_unix_stream_timeout_zero_duration() {
-    //     let (_, socket_path) = or_panic!(tmpdir());
+    //     let (_dir, socket_path) = or_panic!(tmpdir());
     //     let listener = or_panic!(UnixListener::bind(&socket_path));
     //     let stream = or_panic!(UnixStream::connect(&socket_path));
 

@@ -1051,23 +1051,20 @@ mod tests {
 
     #[test]
     fn uds_connect() {
-        let (_, addr_template) = t!(tmpdir());
-        let l = t!(UnixListener::bind(&addr_template));
+        let (_dir, addr_template) = t!(tmpdir());
+        let l = t!(inner::UnixListener::bind(&addr_template));
         let addr = t!(l.local_addr());
         let t = thread::spawn(move || {
             t!(l.accept());
         });
 
         let cp = t!(CompletionPort::new(1));
-        let socket = t!(Socket::new());
+        let socket = t!(inner::UnixStream::new());
         let (c_addr, len) = t!(unsafe { sockaddr_un(&addr_template) });
         t!(cvt(unsafe {
             bind(socket.as_raw_socket() as usize, &c_addr as *const _ as *const _, len as _)
         }));
         t!(cp.add_socket(1, &socket));
-        let socket = unsafe {
-            inner::UnixStream::from_raw_socket(socket.into_raw_socket())
-        };
 
         let a = Overlapped::zero();
         unsafe {
