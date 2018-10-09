@@ -19,7 +19,7 @@ use winapi::shared::ws2def::SOL_SOCKET;
 use winapi::um::minwinbase::*;
 use winapi::um::winsock2::*;
 
-use inner::{c, SocketAddr};
+use inner::{c, sun_path_offset, SocketAddr};
 use inner::net::{UnixListener, UnixStream};
 
 /// A type to represent a buffer in which an accepted socket's address will be
@@ -283,7 +283,7 @@ fn cvt(i: c_int, size: DWORD) -> io::Result<Option<usize>> {
 }
 
 fn socket_addr_to_ptrs(addr: &SocketAddr) -> (*const SOCKADDR, c_int) {
-    (addr as *const _ as *const _, mem::size_of::<c::sockaddr_un>() as c_int)
+    (&addr.addr as *const _ as *const _, mem::size_of::<c::sockaddr_un>() as c_int)
 }
 
 unsafe fn ptrs_to_socket_addr(ptr: *const SOCKADDR,
@@ -294,9 +294,22 @@ unsafe fn ptrs_to_socket_addr(ptr: *const SOCKADDR,
     match (*ptr).sa_family {
         c::AF_UNIX if len as usize >= mem::size_of::<c::sockaddr_un>() => {
             let b = &*(ptr as *const c::sockaddr_un);
-            SocketAddr::from_parts(b.clone(), len).ok()
+            match b.sun_path.iter().position(|c| *c == 0) {
+                Some(0) => {
+                    SocketAddr::from_parts(b.clone(), len).ok()
+                }
+                Some(i) => {
+                    let mut l = sun_path_offset() + i;
+                    match b.sun_path.get(0) {
+                        Some(&0) | None => {}
+                        Some(_) => l += 1,
+                    }
+                    SocketAddr::from_parts(b.clone(), l as c_int).ok()
+                }
+                _ => None, // TODO: panic??
+            }
         }
-        _ => None
+        _ => None,
     }
 }
 
@@ -399,6 +412,17 @@ unsafe fn connect_overlapped(socket: SOCKET,
                              buf: &[u8],
                              overlapped: *mut OVERLAPPED)
                              -> io::Result<Option<usize>> {
+    let anonaddr = c::sockaddr_un {
+        sun_family: c::AF_UNIX,
+        sun_path: [0; 108],
+    };
+    let len = mem::size_of::<c::sockaddr_un>() as c_int;
+    super::cvt(bind(
+        socket as usize,
+        &anonaddr as *const _ as *const _,
+        len as _,
+    ))?;
+
     static CONNECTEX: WsaExtension = WsaExtension {
         guid: GUID {
             Data1: 0x25a207b9,

@@ -969,16 +969,15 @@ fn accept_done(status: &OVERLAPPED_ENTRY) {
 mod tests {
     use std::io;
     use std::io::prelude::*;
-    use std::os::windows::io::{AsRawSocket, FromRawSocket, IntoRawSocket};
+    use std::os::windows::io::{FromRawSocket, IntoRawSocket};
     use std::path::PathBuf;
     use std::thread;
 
     use miow::{iocp::CompletionPort, Overlapped};
     use tempdir::TempDir;
-    use winapi::um::winsock2::bind;
 
-    use inner::{self, cvt, sockaddr_un, Socket, AcceptAddrsBuf, UnixListenerExt, UnixStreamExt};
-    use super::{UnixListener, UnixStream};
+    use inner::{self, Socket, AcceptAddrsBuf, UnixListenerExt, UnixStreamExt};
+    use super::UnixListener;
 
     macro_rules! t {
         ($e:expr) => (match $e {
@@ -1050,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn uds_connect() {
+    fn uds_connect_overlapped() {
         let (_dir, addr_template) = t!(tmpdir());
         let l = t!(inner::UnixListener::bind(&addr_template));
         let addr = t!(l.local_addr());
@@ -1058,12 +1057,8 @@ mod tests {
             t!(l.accept());
         });
 
-        let cp = t!(CompletionPort::new(1));
         let socket = t!(inner::UnixStream::new());
-        let (c_addr, len) = t!(unsafe { sockaddr_un(&addr_template) });
-        t!(cvt(unsafe {
-            bind(socket.as_raw_socket() as usize, &c_addr as *const _ as *const _, len as _)
-        }));
+        let cp = t!(CompletionPort::new(1));
         t!(cp.add_socket(1, &socket));
 
         let a = Overlapped::zero();
@@ -1080,20 +1075,21 @@ mod tests {
     }
 
     #[test]
-    fn use_accept() {
-        let (_, addr) = t!(tmpdir());
+    fn uds_accept_overlapped() {
+        let (_dir, addr) = t!(tmpdir());
         let l = t!(inner::UnixListener::bind(&addr));
         let t = thread::spawn(move || {
-            let socket = t!(UnixStream::connect(&addr));
+            let socket = t!(inner::UnixStream::connect(&addr));
             (socket.local_addr().unwrap(), socket.peer_addr().unwrap())
         });
 
-        let cp = t!(CompletionPort::new(1));
         let socket = t!(Socket::new());
-        t!(cp.add_socket(1, &l));
         let socket = unsafe {
             inner::UnixStream::from_raw_socket(socket.into_raw_socket())
         };
+
+        let cp = t!(CompletionPort::new(1));
+        t!(cp.add_socket(1, &l));
 
         let a = Overlapped::zero();
         let mut addrs = AcceptAddrsBuf::new();

@@ -29,7 +29,7 @@ mod c {
     }
 }
 
-fn sun_path_offset() -> usize {
+pub fn sun_path_offset() -> usize {
     // Work with an actual instance of the type since using a null pointer is UB
     let addr: c::sockaddr_un = unsafe { mem::uninitialized() };
     let base = &addr as *const _ as usize;
