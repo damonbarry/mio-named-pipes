@@ -27,7 +27,7 @@ use winapi::{
     um::processthreadsapi::GetCurrentProcessId,
     um::winbase::HANDLE_FLAG_INHERIT,
     um::winsock2::{
-        accept, closesocket, getsockopt as c_getsockopt, ioctlsocket, shutdown as c_shutdown,
+        accept, closesocket, getsockopt as c_getsockopt, ioctlsocket, recv, send, shutdown as c_shutdown,
         WSAStartup, WSADuplicateSocketW, WSASocketW,
         FIONBIO, SD_BOTH, SD_RECEIVE, SD_SEND,
         INVALID_SOCKET, SOCKET, WSADATA, WSAPROTOCOL_INFOW, WSA_FLAG_OVERLAPPED,
@@ -132,6 +132,30 @@ impl Socket {
         }?;
         socket.set_no_inherit()?;
         Ok(socket)
+    }
+
+    fn recv_with_flags(&self, buf: &mut [u8], flags: c_int) -> io::Result<usize> {
+        let ret = cvt(unsafe {
+            recv(self.0,
+                 buf.as_mut_ptr() as *mut _,
+                 buf.len() as c_int,
+                 flags)
+        })?;
+        Ok(ret as usize)
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.recv_with_flags(buf, 0)
+    }
+
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
+        let ret = cvt(unsafe {
+            send(self.0,
+                 buf as *const _ as *const _,
+                 buf.len() as c_int,
+                 0)
+        })?;
+        Ok(ret as usize)
     }
 
     fn set_no_inherit(&self) -> io::Result<()> {

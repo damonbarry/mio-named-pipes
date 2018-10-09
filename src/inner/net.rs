@@ -216,6 +216,38 @@ impl UnixStream {
     }
 }
 
+impl io::Read for UnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::Read::read(&mut &*self, buf)
+    }
+}
+
+impl<'a> io::Read for &'a UnixStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl io::Write for UnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::Write::write(&mut &*self, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::Write::flush(&mut &*self)
+    }
+}
+
+impl<'a> io::Write for &'a UnixStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl AsRawSocket for UnixStream {
     fn as_raw_socket(&self) -> RawSocket {
         self.0.as_raw_socket()
@@ -521,7 +553,7 @@ impl<'a> Iterator for Incoming<'a> {
 
 #[cfg(test)]
 mod test {
-    use std::io;
+    use std::io::{self, Read, Write};
     use std::path::PathBuf;
     use std::thread;
 
@@ -547,25 +579,25 @@ mod test {
     #[test]
     fn basic() {
         let (_dir, socket_path) = or_panic!(tmpdir());
-        // let msg1 = b"hello";
-        // let msg2 = b"world!";
+        let msg1 = b"hello";
+        let msg2 = b"world!";
 
         let listener = or_panic!(UnixListener::bind(&socket_path));
         let thread = thread::spawn(move || {
-            let mut _stream = or_panic!(listener.accept()).0;
-            // let mut buf = [0; 5];
-            // or_panic!(stream.read(&mut buf));
-            // assert_eq!(&msg1[..], &buf[..]);
-            // or_panic!(stream.write_all(msg2));
+            let mut stream = or_panic!(listener.accept()).0;
+            let mut buf = [0; 5];
+            or_panic!(stream.read(&mut buf));
+            assert_eq!(&msg1[..], &buf[..]);
+            or_panic!(stream.write_all(msg2));
         });
 
-        let stream = or_panic!(UnixStream::connect(&socket_path));
+        let mut stream = or_panic!(UnixStream::connect(&socket_path));
         assert_eq!(Some(&*socket_path),
                    stream.peer_addr().unwrap().as_pathname());
-        // or_panic!(stream.write_all(msg1));
-        // let mut buf = vec![];
-        // or_panic!(stream.read_to_end(&mut buf));
-        // assert_eq!(&msg2[..], &buf[..]);
+        or_panic!(stream.write_all(msg1));
+        let mut buf = vec![];
+        or_panic!(stream.read_to_end(&mut buf));
+        assert_eq!(&msg2[..], &buf[..]);
         drop(stream);
 
         thread.join().unwrap();
@@ -597,27 +629,27 @@ mod test {
     #[test]
     fn try_clone() {
         let (_dir, socket_path) = or_panic!(tmpdir());
-        // let msg1 = b"hello";
-        // let msg2 = b"world";
+        let msg1 = b"hello";
+        let msg2 = b"world";
 
         let listener = or_panic!(UnixListener::bind(&socket_path));
         let thread = thread::spawn(move || {
             #[allow(unused_mut)]
-            let mut _stream = or_panic!(listener.accept()).0;
-            // or_panic!(stream.write_all(msg1));
-            // or_panic!(stream.write_all(msg2));
+            let mut stream = or_panic!(listener.accept()).0;
+            or_panic!(stream.write_all(msg1));
+            or_panic!(stream.write_all(msg2));
         });
 
-        let stream = or_panic!(UnixStream::connect(&socket_path));
-        let stream2 = or_panic!(stream.try_clone());
+        let mut stream = or_panic!(UnixStream::connect(&socket_path));
+        let mut stream2 = or_panic!(stream.try_clone());
         assert_eq!(Some(&*socket_path),
                    stream2.peer_addr().unwrap().as_pathname());
 
-        // let mut buf = [0; 5];
-        // or_panic!(stream.read(&mut buf));
-        // assert_eq!(&msg1[..], &buf[..]);
-        // or_panic!(stream2.read(&mut buf));
-        // assert_eq!(&msg2[..], &buf[..]);
+        let mut buf = [0; 5];
+        or_panic!(stream.read(&mut buf));
+        assert_eq!(&msg1[..], &buf[..]);
+        or_panic!(stream2.read(&mut buf));
+        assert_eq!(&msg2[..], &buf[..]);
 
         thread.join().unwrap();
     }
@@ -629,15 +661,15 @@ mod test {
         let listener = or_panic!(UnixListener::bind(&socket_path));
         let thread = thread::spawn(move || {
             for stream in listener.incoming().take(2) {
-                let mut _stream = or_panic!(stream);
-                // let mut buf = [0];
-                // or_panic!(stream.read(&mut buf));
+                let mut stream = or_panic!(stream);
+                let mut buf = [0];
+                or_panic!(stream.read(&mut buf));
             }
         });
 
         for _ in 0..2 {
-            let mut _stream = or_panic!(UnixStream::connect(&socket_path));
-            // or_panic!(stream.write_all(&[0]));
+            let mut stream = or_panic!(UnixStream::connect(&socket_path));
+            or_panic!(stream.write_all(&[0]));
         }
 
         thread.join().unwrap();

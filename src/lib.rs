@@ -993,16 +993,17 @@ mod tests {
     }
 
     #[test]
-    fn uds_read() {
-        let (_, addr) = t!(tmpdir());
-        let l = t!(UnixListener::bind(&addr));
+    fn uds_read_overlapped() {
+        let (_dir, addr) = t!(tmpdir());
+        let l = t!(inner::UnixListener::bind(&addr));
         let t = thread::spawn(move || {
             let mut a = t!(l.accept()).0;
             t!(a.write_all(&[1, 2, 3]));
         });
 
-        let cp = t!(CompletionPort::new(1));
         let s = t!(inner::UnixStream::connect(&addr));
+
+        let cp = t!(CompletionPort::new(1));
         t!(cp.add_socket(1, &s));
 
         let mut b = [0; 10];
