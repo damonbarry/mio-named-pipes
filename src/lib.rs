@@ -977,7 +977,6 @@ mod tests {
     use tempdir::TempDir;
 
     use inner::{self, Socket, AcceptAddrsBuf, UnixListenerExt, UnixStreamExt};
-    use super::UnixListener;
 
     macro_rules! t {
         ($e:expr) => (match $e {
@@ -1021,9 +1020,9 @@ mod tests {
     }
 
     #[test]
-    fn uds_write() {
-        let (_, addr) = t!(tmpdir());
-        let l = t!(UnixListener::bind(&addr));
+    fn uds_write_overlapped() {
+        let (_dir, addr) = t!(tmpdir());
+        let l = t!(inner::UnixListener::bind(&addr));
         let t = thread::spawn(move || {
             let mut a = t!(l.accept()).0;
             let mut b = [0; 10];
