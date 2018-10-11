@@ -1,3 +1,5 @@
+#![allow(missing_docs)]
+
 use std::ascii;
 use std::fmt;
 use std::io;

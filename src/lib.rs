@@ -131,6 +131,7 @@ struct InnerStream {
 struct StreamIo {
     read: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
     write: State<(Vec<u8>, usize), (Vec<u8>, usize)>,
+    deferred_connect: Option<SocketAddr>,
     connect_error: Option<io::Error>,
 }
 
@@ -149,86 +150,52 @@ fn _assert_kinds() {
 }
 
 impl UnixStream {
+    fn new(socket: RawSocket, addr: Option<SocketAddr>) -> UnixStream {
+        let (r, s) = Registration::new2();
+        UnixStream {
+            registered: AtomicBool::new(false),
+            ready_registration: r,
+            poll_registration: windows::Binding::new(),
+            inner: FromRawArc::new(InnerStream {
+                socket: unsafe { inner::UnixStream::from_raw_socket(socket) },
+                readiness: s,
+                connecting: AtomicBool::new(false),
+                // transmutes to straddle winapi versions (mio 0.6 is on an
+                // older winapi)
+                connect: windows::Overlapped::new(unsafe { mem::transmute(connect_done as fn(_)) }),
+                read: windows::Overlapped::new(unsafe { mem::transmute(read_done as fn(_)) }),
+                write: windows::Overlapped::new(unsafe { mem::transmute(write_done as fn(_)) }),
+                io: Mutex::new(StreamIo {
+                    read: State::None,
+                    write: State::None,
+                    deferred_connect: addr,
+                    connect_error: None,
+                }),
+            }),
+        }
+    }
+
     /// Connects to the socket named by `path`.
     ///
-    /// This function will attempt to connect this pipe to a client in an
-    /// asynchronous fashion. If the function immediately establishes a
-    /// connection to a client then `Ok(())` is returned. Otherwise if a
-    /// connection attempt was issued and is now in progress then a "would
-    /// block" error is returned.
-    ///
-    /// When the connection is finished then this object will be flagged as
-    /// being ready for a write, or otherwise in the writable state.
-    ///
-    /// # Errors
-    ///
-    /// This function will return a "would block" error if the pipe has not yet
-    /// been registered with an event loop, if the connection operation has
-    /// previously been issued but has not yet completed, or if the connect
-    /// itself was issued and didn't finish immediately.
-    ///
-    /// Normal I/O errors from the call to `ConnectNamedPipe` are returned
-    /// immediately.
+    /// The socket returned may not be readable and/or writable yet, as the
+    /// connection may be in progress. The socket should be registered with an
+    /// event loop to wait on both of these properties being available.
     pub fn connect<P: AsRef<Path>>(path: P) -> io::Result<UnixStream> {
         UnixStream::_connect(path.as_ref())
     }
 
     fn _connect(path: &Path) -> io::Result<UnixStream> {
         let sock = inner::UnixStream::new()?;
-        let sock = unsafe {
-            UnixStream::from_raw_socket(sock.into_raw_socket())
-        };
-
-        // Make sure we're associated with an IOCP object
-        if !sock.registered() {
-            return Err(would_block())
-        }
+        sock.set_nonblocking(true)?;
+        let addr = SocketAddr::from_path(path)?;
+        let sock = UnixStream::new(sock.into_raw_socket(), Some(addr));
 
         // "Acquire the connecting lock" or otherwise just make sure we're the
         // only operation that's using the `connect` overlapped instance.
-        if sock.inner.connecting.swap(true, SeqCst) {
-            return Err(would_block())
-        }
+        let prev = sock.inner.connecting.swap(true, SeqCst);
+        assert!(!prev);
 
-        // Now that we've flagged ourselves in the connecting state, issue the
-        // connection attempt. Afterwards interpret the return value and set
-        // internal state accordingly.
-        let res = unsafe {
-            let addr = SocketAddr::from_path(path)?;
-            let overlapped = sock.inner.connect.as_mut_ptr() as *mut _;
-            sock.inner.socket.connect_overlapped(&addr, &[], overlapped)
-        };
-
-        match res {
-            // The connection operation finished immediately, so let's schedule
-            // reads/writes and such.
-            Ok(Some(_)) => {
-                trace!("connect done immediately");
-                sock.inner.connecting.store(false, SeqCst);
-                InnerStream::post_register(&sock.inner);
-                Ok(sock)
-            }
-
-            // If the overlapped operation was successful and didn't finish
-            // immediately then we forget a copy of the arc we hold
-            // internally. This ensures that when the completion status comes
-            // in for the I/O operation finishing it'll have a reference
-            // associated with it and our data will still be valid. The
-            // `connect_done` function will "reify" this forgotten pointer to
-            // drop the refcount on the other side.
-            Ok(None) => {
-                trace!("connect in progress");
-                mem::forget(sock.inner.clone());
-                Err(would_block())
-            }
-
-            // TODO: are we sure no IOCP notification comes in here?
-            Err(e) => {
-                trace!("connect error: {}", e);
-                sock.inner.connecting.store(false, SeqCst);
-                Err(e)
-            }
-        }
+        Ok(sock)
     }
 
     /// Takes any internal error that has happened after the last I/O operation
@@ -381,6 +348,15 @@ impl Evented for UnixStream {
         }
         try!(poll.register(&self.ready_registration, token, interest, opts));
         self.registered.store(true, SeqCst);
+
+        // If we were connected before being registered process that request
+        // here and go along our merry ways. Note that the callback for a
+        // successful connect will worry about generating writable/readable
+        // events and scheduling a new read.
+        if let Some(addr) = self.inner.io.lock().unwrap().deferred_connect.take() {
+            return InnerStream::schedule_connect(&self.inner, &addr).map(|_| ())
+        }
+
         InnerStream::post_register(&self.inner);
         Ok(())
     }
@@ -424,27 +400,7 @@ impl AsRawSocket for UnixStream {
 
 impl FromRawSocket for UnixStream {
     unsafe fn from_raw_socket(socket: RawSocket) -> UnixStream {
-        let (r, s) = Registration::new2();
-        UnixStream {
-            registered: AtomicBool::new(false),
-            ready_registration: r,
-            poll_registration: windows::Binding::new(),
-            inner: FromRawArc::new(InnerStream {
-                socket: inner::UnixStream::from_raw_socket(socket),
-                readiness: s,
-                connecting: AtomicBool::new(false),
-                // transmutes to straddle winapi versions (mio 0.6 is on an
-                // older winapi)
-                connect: windows::Overlapped::new(mem::transmute(connect_done as fn(_))),
-                read: windows::Overlapped::new(mem::transmute(read_done as fn(_))),
-                write: windows::Overlapped::new(mem::transmute(write_done as fn(_))),
-                io: Mutex::new(StreamIo {
-                    read: State::None,
-                    write: State::None,
-                    connect_error: None,
-                }),
-            }),
-        }
+        UnixStream::new(socket, None)
     }
 }
 
@@ -474,6 +430,16 @@ impl Drop for UnixStream {
 }
 
 impl InnerStream {
+    fn schedule_connect(me: &FromRawArc<InnerStream>, addr: &SocketAddr) -> io::Result<()> {
+        unsafe {
+            let overlapped = me.connect.as_mut_ptr() as *mut _;
+            me.socket.connect_overlapped(&addr, &[], overlapped)?;
+        }
+
+        mem::forget(me.clone());
+        Ok(())
+    }
+
     /// Schedules a read to happen in the background, executing an overlapped
     /// operation.
     ///
@@ -702,7 +668,8 @@ struct InnerListener {
 }
 
 struct ListenerIo {
-    accept: State<(inner::UnixStream, AcceptAddrsBuf), (UnixStream, SocketAddr)>,
+    accept: State<inner::UnixStream, (UnixStream, SocketAddr)>,
+    accept_buf: AcceptAddrsBuf,
 }
 
 impl UnixListener {
@@ -715,28 +682,39 @@ impl UnixListener {
         Ok(sock)
     }
 
-    /// Accepts an incoming connection
-    pub fn accept(&self) -> io::Result<(UnixStream, SocketAddr)> {
+    /// Accepts a new incoming connection to this listener.
+    ///
+    /// This may return an `Err(e)` where `e.kind()` is
+    /// `io::ErrorKind::WouldBlock`. This means a stream may be ready at a later
+    /// point and one should wait for a notification before calling `accept`
+    /// again.
+    ///
+    /// If an accepted stream is returned, the remote address of the peer is
+    /// returned along with it.
+    pub fn accept(&self) -> io::Result<Option<(UnixStream, SocketAddr)>> {
         // Make sure we're associated with an IOCP object
         if !self.registered() {
-            return Err(would_block())
+            return Err(io::ErrorKind::WouldBlock.into());
         }
 
-        let mut state = self.inner.io.lock().unwrap();
-        let ret = match mem::replace(&mut state.accept, State::None) {
-            State::None => Err(would_block()),
+        let mut io = self.inner.io.lock().unwrap();
+        let ret = match mem::replace(&mut io.accept, State::None) {
+            State::None => return Err(io::ErrorKind::WouldBlock.into()),
 
-            State::Pending((s, b)) => {
-                state.accept = State::Pending((s, b));
-                Err(would_block())
+            State::Pending(s) => {
+                io.accept = State::Pending(s);
+                return Err(io::ErrorKind::WouldBlock.into());
             }
 
-            State::Ok((s, a)) => Ok((s, a)),
+            State::Ok((s, a)) => Ok(Some((s, a))),
 
-            State::Err(e) => Err(e)
+            State::Err(e) => {
+                assert!(e.kind() != io::ErrorKind::WouldBlock);
+                Err(e)
+            }
         };
 
-        InnerListener::schedule_accept(&self.inner, &mut state);
+        InnerListener::schedule_accept(&self.inner, &mut io);
 
         ret
     }
@@ -748,9 +726,9 @@ impl UnixListener {
     }
 
     /// Creates a new independently owned handle to the underlying socket.
-    pub fn try_clone(&self) -> io::Result<UnixStream> {
+    pub fn try_clone(&self) -> io::Result<UnixListener> {
         self.inner.socket.try_clone().map(|s| unsafe {
-            UnixStream::from_raw_socket(s.into_raw_socket())
+            UnixListener::from_raw_socket(s.into_raw_socket())
         })
     }
 
@@ -834,6 +812,7 @@ impl FromRawSocket for UnixListener {
                 accept: windows::Overlapped::new(mem::transmute(accept_done as fn(_))),
                 io: Mutex::new(ListenerIo {
                     accept: State::None,
+                    accept_buf: AcceptAddrsBuf::new(),
                 }),
             }),
         }
@@ -880,21 +859,20 @@ impl InnerListener {
         let res = inner::UnixStream::new()
             .and_then(|sock| {
                 // TODO: need to be smarter about buffer management here
-                let mut addrs = AcceptAddrsBuf::new();
                 let overlapped = me.accept.as_mut_ptr() as *mut _;
                 unsafe {
-                    me.socket.accept_overlapped(&sock, &mut addrs, overlapped)
-                }.map(|_| (sock, addrs))
+                    me.socket.accept_overlapped(&sock, &mut io.accept_buf, overlapped)
+                }.map(|_| sock)
             });
 
         match res {
-            Ok((sock, addrs)) => {
+            Ok(sock) => {
                 // See `connect` above for the rationale behind `forget`
                 trace!("accept is ready");
                 let s = unsafe {
                     inner::UnixStream::from_raw_socket(sock.into_raw_socket())
                 };
-                io.accept = State::Pending((s, addrs));
+                io.accept = State::Pending(s);
                 mem::forget(me.clone());
             }
 
@@ -930,32 +908,25 @@ fn accept_done(status: &OVERLAPPED_ENTRY) {
 
     // Move from the `Pending` to `Ok` state.
     let mut io = me.io.lock().unwrap();
-    let (sock, buf) = match mem::replace(&mut io.accept, State::None) {
-        State::Pending((s, b)) => (s, b),
+    let sock = match mem::replace(&mut io.accept, State::None) {
+        State::Pending(s) => s,
         _ => unreachable!(),
     };
 
     trace!("accept finished");
 
-    let res = unsafe { me.socket.result(status.overlapped()) }
-        .and_then(|(n, _)| {
-            debug_assert_eq!(status.bytes_transferred() as usize, n);
-            Ok(())
-        })
-        .or_else(|e| {
-            debug_assert_eq!(status.bytes_transferred(), 0);
-            Err(e)
-        })
-        .and_then(|()| me.socket.accept_complete(&sock))
-        .and_then(|()| buf.parse(&me.socket))
-        .and_then(|b| b.remote().ok_or_else(
-            || io::Error::new(io::ErrorKind::Other, "could not obtain remote address")
-        ));
+    let res = me.socket.accept_complete(&sock)
+        .and_then(|()| io.accept_buf.parse(&me.socket))
+        .and_then(|buf| {
+            buf.remote().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "could not obtain remote address")
+            })
+        });
 
     io.accept = match res {
-        Ok(addr) => {
+        Ok(remote_addr) => {
             let outer = unsafe { UnixStream::from_raw_socket(sock.into_raw_socket()) };
-            State::Ok((outer, addr))
+            State::Ok((outer, remote_addr))
         }
 
         Err(e) => State::Err(e),
@@ -963,4 +934,9 @@ fn accept_done(status: &OVERLAPPED_ENTRY) {
 
     // Flag our readiness that we've got data.
     me.add_readiness(Ready::readable());
+}
+
+#[allow(missing_docs)]
+pub mod net {
+    pub use inner::*;
 }

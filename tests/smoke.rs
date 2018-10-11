@@ -1,19 +1,18 @@
+// extern crate iovec;
 extern crate mio;
-extern crate mio_uds_windows;
-extern crate env_logger;
 extern crate tempdir;
-extern crate winapi;
+extern crate mio_uds_windows;
 
-#[macro_use]
-extern crate log;
+// use std::io::prelude::*;
+// use std::time::Duration;
+use std::io;
+use std::sync::mpsc::channel;
+use std::thread;
 
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
-
-use mio::{Poll, Ready, Token, PollOpt, Events};
-use mio_uds_windows::{UnixListener, UnixStream};
+// use iovec::IoVec;
+use mio::*;
+use mio_uds_windows::*;
+use mio_uds_windows::net;
 use tempdir::TempDir;
 
 macro_rules! t {
@@ -23,269 +22,182 @@ macro_rules! t {
     })
 }
 
-struct TempPath(TempDir);
-
-impl TempPath {
-    fn new() -> Result<TempPath, io::Error> {
-        let dir = TempDir::new("mio-uds-windows")?;
-        Ok(TempPath(dir))
-    }
-
-    fn name(&self) -> PathBuf {
-        self.0.path().join("sock")
-    }
-}
-
-fn server() -> (UnixListener, TempPath) {
-    let path = t!(TempPath::new());
-    let stream = t!(UnixListener::bind(path.name()));
-    (stream, path)
-}
-
-fn client(path: &Path) -> UnixStream {
-    t!(UnixStream::connect(path))
-}
-
-fn session() -> (UnixListener, UnixStream) {
-    let (server, path) = server();
-    (server, client(&path.name()))
-}
+ // tests adapted from mio::test::test_tcp
 
 #[test]
-fn writable_after_register() {
-    drop(env_logger::init());
+fn accept() {
+    struct H { hit: bool, listener: UnixListener, shutdown: bool }
 
-    let (server, client) = session();
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::writable() | Ready::readable(),
-                     PollOpt::edge()));
-    t!(poll.register(&client,
-                     Token(1),
-                     Ready::writable(),
-                     PollOpt::edge()));
+    let td = t!(TempDir::new("uds"));
+    let l = UnixListener::bind(td.path().join("foo")).unwrap();
+    let addr = l.local_addr().unwrap();
 
-    let mut events = Events::with_capacity(128);
-    t!(poll.poll(&mut events, None));
+    let t = thread::spawn(move || {
+        net::UnixStream::connect(addr.as_pathname().unwrap()).unwrap();
+    });
 
-    let events = events.iter().collect::<Vec<_>>();
-    debug!("events {:?}", events);
-    assert!(events.iter().any(|e| {
-        e.token() == Token(0) && e.readiness() == Ready::writable()
-    }));
-    assert!(events.iter().any(|e| {
-        e.token() == Token(1) && e.readiness() == Ready::writable()
-    }));
-}
+    let poll = Poll::new().unwrap();
 
-#[test]
-fn write_then_read() {
-    drop(env_logger::init());
-
-    let (server, mut client) = session();
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    t!(poll.register(&client,
-                     Token(1),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
+    poll.register(&l, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    loop {
-        t!(poll.poll(&mut events, None));
-        let events = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", events);
-        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_readable() {
-                break
-            }
+    let mut h = H { hit: false, listener: l, shutdown: false };
+    while !h.shutdown {
+        poll.poll(&mut events, None).unwrap();
+
+        for event in &events {
+            h.hit = true;
+            assert_eq!(event.token(), Token(1));
+            assert!(event.readiness().is_readable());
+            assert!(h.listener.accept().is_ok());
+            h.shutdown = true;
         }
     }
-
-    let (mut conn, _) = server.accept().unwrap();
-
-    assert_eq!(t!(client.write(b"1234")), 4);
-
-    loop {
-        t!(poll.poll(&mut events, None));
-        let events = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", events);
-        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_readable() {
-                break
-            }
-        }
-    }
-
-    let mut buf = [0; 10];
-    assert_eq!(t!(conn.read(&mut buf)), 4);
-    assert_eq!(&buf[..4], b"1234");
+    assert!(h.hit);
+    assert!(h.listener.accept().unwrap_err().kind() == io::ErrorKind::WouldBlock);
+    t.join().unwrap();
 }
 
 #[test]
-fn accept_before_client() {
-    drop(env_logger::init());
+fn connect() {
+    struct H { hit: u32, shutdown: bool }
 
-    let (server, path) = server();
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
+    let td = t!(TempDir::new("uds"));
+    let l = net::UnixListener::bind(td.path().join("foo")).unwrap();
+    let addr = l.local_addr().unwrap();
 
-    let mut events = Events::with_capacity(128);
-    t!(poll.poll(&mut events, Some(Duration::new(0, 0))));
-    let e = events.iter().collect::<Vec<_>>();
-    debug!("events {:?}", e);
-    assert_eq!(e.len(), 0);
-    assert_eq!(server.accept().err().unwrap().kind(),
-               io::ErrorKind::WouldBlock);
+    let (tx, rx) = channel();
+    let (tx2, rx2) = channel();
+    let t = thread::spawn(move || {
+        let s = l.accept().unwrap();
+        rx.recv().unwrap();
+        drop(s);
+        tx2.send(()).unwrap();
+    });
 
-    let client = client(&path.name());
-    t!(poll.register(&client,
-                     Token(1),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    loop {
-        t!(poll.poll(&mut events, None));
-        let e = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", e);
-        if let Some(event) = e.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_writable() {
-                break
-            }
-        }
-    }
-}
+    let poll = Poll::new().unwrap();
+    let s = UnixStream::connect(addr.as_pathname().unwrap()).unwrap();
 
-#[test]
-fn accept_after_client() {
-    drop(env_logger::init());
-
-    let (server, path) = server();
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-
-    let mut events = Events::with_capacity(128);
-    t!(poll.poll(&mut events, Some(Duration::new(0, 0))));
-    let e = events.iter().collect::<Vec<_>>();
-    debug!("events {:?}", e);
-    assert_eq!(e.len(), 0);
-
-    let client = client(&path.name());
-    t!(poll.register(&client,
-                     Token(1),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    t!(server.accept());
-    loop {
-        t!(poll.poll(&mut events, None));
-        let e = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", e);
-        if let Some(event) = e.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_writable() {
-                break
-            }
-        }
-    }
-}
-
-#[test]
-fn write_then_drop() {
-    drop(env_logger::init());
-
-    let (server, mut client) = session();
-    let (mut conn, _) = server.accept().unwrap();
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    t!(poll.register(&client,
-                     Token(1),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    assert_eq!(t!(client.write(b"1234")), 4);
-    drop(client);
+    poll.register(&s, Token(1), Ready::readable() | Ready::writable(), PollOpt::edge()).unwrap();
 
     let mut events = Events::with_capacity(128);
 
-    loop {
-        t!(poll.poll(&mut events, None));
-        let events = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", events);
-        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_readable() {
-                break
+    let mut h = H { hit: 0, shutdown: false };
+    while !h.shutdown {
+        poll.poll(&mut events, None).unwrap();
+
+        for event in &events {
+            assert_eq!(event.token(), Token(1));
+            match h.hit {
+                0 => assert!(event.readiness().is_writable()),
+                1 => assert!(event.readiness().is_readable()),
+                _ => panic!(),
             }
+            h.hit += 1;
+            h.shutdown = true;
         }
     }
+    assert_eq!(h.hit, 1);
+    tx.send(()).unwrap();
+    rx2.recv().unwrap();
+    h.shutdown = false;
+    while !h.shutdown {
+        poll.poll(&mut events, None).unwrap();
 
-    let mut buf = [0; 10];
-    assert_eq!(t!(conn.read(&mut buf)), 4);
-    assert_eq!(&buf[..4], b"1234");
+        for event in &events {
+            assert_eq!(event.token(), Token(1));
+            match h.hit {
+                0 => assert!(event.readiness().is_writable()),
+                1 => assert!(event.readiness().is_readable()),
+                _ => panic!(),
+            }
+            h.hit += 1;
+            h.shutdown = true;
+        }
+    }
+    assert_eq!(h.hit, 2);
+    t.join().unwrap();
 }
 
-#[test]
-fn connect_twice() {
-    drop(env_logger::init());
+// #[test]
+// fn listener() {
+//     let td = t!(TempDir::new("uds"));
+//     let a = t!(UnixListener::bind(td.path().join("foo")));
+//     assert!(t!(a.accept()).is_none());
+//     t!(a.local_addr());
+//     assert!(t!(a.take_error()).is_none());
+//     let b = t!(a.try_clone());
+//     assert!(t!(b.accept()).is_none());
 
-    let (server, path) = server();
-    let (mut conn1, _) = server.accept().unwrap();
-    let c1 = client(&path.name());
-    let poll = t!(Poll::new());
-    t!(poll.register(&server,
-                     Token(0),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    t!(poll.register(&c1,
-                     Token(1),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
-    drop(c1);
+//     let poll = t!(Poll::new());
+//     let mut events = Events::with_capacity(1024);
 
-    let mut events = Events::with_capacity(128);
+//     t!(poll.register(&a, Token(1), Ready::readable(), PollOpt::edge()));
 
-    loop {
-        t!(poll.poll(&mut events, None));
-        let events = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", events);
-        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_readable() {
-                break
-            }
-        }
-    }
+//     let s = t!(UnixStream::connect(td.path().join("foo")));
 
-    let mut buf = [0; 10];
-    assert_eq!(t!(conn1.read(&mut buf)), 0);
-    t!(conn1.shutdown(Shutdown::Both));
-    assert_eq!(server.accept().err().unwrap().kind(),
-               io::ErrorKind::WouldBlock);
+//     assert_eq!(t!(poll.poll(&mut events, None)), 1);
 
-    let c2 = client(&path.name());
-    let _conn2 = server.accept().unwrap();
-    t!(poll.register(&c2,
-                     Token(2),
-                     Ready::readable() | Ready::writable(),
-                     PollOpt::edge()));
+//     let (s2, addr) = t!(a.accept()).unwrap();
 
-    loop {
-        t!(poll.poll(&mut events, None));
-        let events = events.iter().collect::<Vec<_>>();
-        debug!("events {:?}", events);
-        if let Some(event) = events.iter().find(|e| e.token() == Token(0)) {
-            if event.readiness().is_writable() {
-                break
-            }
-        }
-    }
-}
+//     assert_eq!(t!(s.peer_addr()).as_pathname(), t!(s2.local_addr()).as_pathname());
+//     assert_eq!(t!(s.local_addr()).as_pathname(), t!(s2.peer_addr()).as_pathname());
+//     assert_eq!(addr.as_pathname(), t!(s.local_addr()).as_pathname());
+// }
+
+// #[test]
+// fn stream() {
+//     let poll = t!(Poll::new());
+//     let mut events = Events::with_capacity(1024);
+//     let (mut a, mut b) = t!(UnixStream::pair());
+
+//     let both = Ready::readable() | Ready::writable();
+//     t!(poll.register(&a, Token(1), both, PollOpt::edge()));
+//     t!(poll.register(&b, Token(2), both, PollOpt::edge()));
+
+//     assert_eq!(t!(poll.poll(&mut events, Some(Duration::new(0, 0)))), 2);
+//     assert_eq!(events.get(0).unwrap().readiness(), Ready::writable());
+//     assert_eq!(events.get(1).unwrap().readiness(), Ready::writable());
+
+//     assert_eq!(t!(a.write(&[3])), 1);
+
+//     assert_eq!(t!(poll.poll(&mut events, Some(Duration::new(0, 0)))), 1);
+//     assert!(events.get(0).unwrap().readiness().is_readable());
+//     assert_eq!(events.get(0).unwrap().token(), Token(2));
+
+//     assert_eq!(t!(b.read(&mut [0; 1024])), 1);
+// }
+
+// #[test]
+// fn stream_iovec() {
+//     let poll = t!(Poll::new());
+//     let mut events = Events::with_capacity(1024);
+//     let (a, b) = t!(UnixStream::pair());
+
+//     let both = Ready::readable() | Ready::writable();
+//     t!(poll.register(&a, Token(1), both, PollOpt::edge()));
+//     t!(poll.register(&b, Token(2), both, PollOpt::edge()));
+
+//     assert_eq!(t!(poll.poll(&mut events, Some(Duration::new(0, 0)))), 2);
+//     assert_eq!(events.get(0).unwrap().readiness(), Ready::writable());
+//     assert_eq!(events.get(1).unwrap().readiness(), Ready::writable());
+
+//     let send = b"Hello, World!";
+//     let vecs: [&IoVec;2] = [ (&send[..6]).into(),
+//                              (&send[6..]).into() ];
+
+//     assert_eq!(t!(a.write_bufs(&vecs)), send.len());
+
+//     assert_eq!(t!(poll.poll(&mut events, Some(Duration::new(0, 0)))), 1);
+//     assert!(events.get(0).unwrap().readiness().is_readable());
+//     assert_eq!(events.get(0).unwrap().token(), Token(2));
+
+//     let mut recv = [0; 13];
+//     {
+//         let (mut first, mut last) = recv.split_at_mut(6);
+//         let mut vecs: [&mut IoVec;2] = [ first.into(), last.into() ];
+//         assert_eq!(t!(b.read_bufs(&mut vecs)), send.len());
+//     }
+//     assert_eq!(&send[..], &recv[..]);
+// }
