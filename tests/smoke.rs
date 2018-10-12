@@ -1,15 +1,17 @@
 // extern crate iovec;
+extern crate bytes;
 extern crate mio;
 extern crate tempdir;
 extern crate mio_uds_windows;
 
 // use std::io::prelude::*;
 // use std::time::Duration;
-use std::io;
+use std::io::{self, Read, Write};
 use std::sync::mpsc::channel;
 use std::thread;
 
 // use iovec::IoVec;
+use bytes::{Buf, MutBuf};
 use mio::*;
 use mio_uds_windows::*;
 use mio_uds_windows::net;
@@ -118,6 +120,133 @@ fn connect() {
     }
     assert_eq!(h.hit, 2);
     t.join().unwrap();
+}
+
+#[test]
+fn read() {
+    const N: usize = 16 * 1024 * 1024;
+    struct H { amt: usize, socket: UnixStream, shutdown: bool }
+
+    let td = t!(TempDir::new("uds"));
+    let l = net::UnixListener::bind(td.path().join("foo")).unwrap();
+    let addr = l.local_addr().unwrap();
+
+    let t = thread::spawn(move || {
+        let mut s = l.accept().unwrap().0;
+        let b = [0; 1024];
+        let mut amt = 0;
+        while amt < N {
+            amt += s.write(&b).unwrap();
+        }
+    });
+
+    let poll = Poll::new().unwrap();
+    let s = UnixStream::connect(addr.as_pathname().unwrap()).unwrap();
+
+    poll.register(&s, Token(1), Ready::readable(), PollOpt::edge()).unwrap();
+
+    let mut events = Events::with_capacity(128);
+
+    let mut h = H { amt: 0, socket: s, shutdown: false };
+    while !h.shutdown {
+        poll.poll(&mut events, None).unwrap();
+
+        for event in &events {
+            assert_eq!(event.token(), Token(1));
+            let mut b = [0; 1024];
+            loop {
+                if let Some(amt) = h.socket.try_read(&mut b).unwrap() {
+                    h.amt += amt;
+                } else {
+                    break
+                }
+                if h.amt >= N {
+                    h.shutdown = true;
+                    break
+                }
+            }
+        }
+    }
+    t.join().unwrap();
+}
+
+/*
+ *
+ * ===== Helpers =====
+ *
+ */
+
+pub trait TryRead {
+    fn try_read_buf<B: MutBuf>(&mut self, buf: &mut B) -> io::Result<Option<usize>>
+        where Self : Sized
+    {
+        // Reads the length of the slice supplied by buf.mut_bytes into the buffer
+        // This is not guaranteed to consume an entire datagram or segment.
+        // If your protocol is msg based (instead of continuous stream) you should
+        // ensure that your buffer is large enough to hold an entire segment (1532 bytes if not jumbo
+        // frames)
+        let res = self.try_read(unsafe { buf.mut_bytes() });
+
+        if let Ok(Some(cnt)) = res {
+            unsafe { buf.advance(cnt); }
+        }
+
+        res
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>>;
+}
+
+pub trait TryWrite {
+    fn try_write_buf<B: Buf>(&mut self, buf: &mut B) -> io::Result<Option<usize>>
+        where Self : Sized
+    {
+        let res = self.try_write(buf.bytes());
+
+        if let Ok(Some(cnt)) = res {
+            buf.advance(cnt);
+        }
+
+        res
+    }
+
+    fn try_write(&mut self, buf: &[u8]) -> io::Result<Option<usize>>;
+}
+
+impl<T: Read> TryRead for T {
+    fn try_read(&mut self, dst: &mut [u8]) -> io::Result<Option<usize>> {
+        self.read(dst).map_non_block()
+    }
+}
+
+impl<T: Write> TryWrite for T {
+    fn try_write(&mut self, src: &[u8]) -> io::Result<Option<usize>> {
+        self.write(src).map_non_block()
+    }
+}
+
+/// A helper trait to provide the map_non_block function on Results.
+trait MapNonBlock<T> {
+    /// Maps a `Result<T>` to a `Result<Option<T>>` by converting
+    /// operation-would-block errors into `Ok(None)`.
+    fn map_non_block(self) -> io::Result<Option<T>>;
+}
+
+impl<T> MapNonBlock<T> for io::Result<T> {
+    fn map_non_block(self) -> io::Result<Option<T>> {
+        use std::io::ErrorKind::WouldBlock;
+
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(err) => {
+                if let WouldBlock = err.kind() {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
 }
 
 // #[test]
